@@ -1,0 +1,604 @@
+---
+title: "Final Project"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+date: "2026-05-01"
+---
+```{r}
+# setup
+
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(randomForest)
+library(Metrics)
+library(corrplot)
+library(gridExtra)
+library(reshape2)
+
+select   <- dplyr::select
+filter   <- dplyr::filter
+mutate   <- dplyr::mutate
+summarise <- dplyr::summarise
+rename   <- dplyr::rename
+arrange  <- dplyr::arrange
+
+# code styling
+while (!is.null(dev.list())) dev.off()
+
+# Palette
+PAL <- list(
+  rooms  = c("#2C7BB6","#F46D43","#1A9641","#984EA3",
+             "#FF7F00","#A65628","#F781BF","#999999","#E41A1C"),
+  models = c(Naive="#AAAAAA", SARIMAX="#F46D43", RF="#1A9641")
+)
+
+# Room dictionary
+ROOMS <- tibble(
+  id     = 1:9,
+  name   = c("Kitchen","Living Room","Laundry",
+             "Home Office","Bathroom","Garage/North",
+             "Bedroom 1","Bedroom 2","Parents Room"),
+  T_col  = paste0("T", 1:9),
+  RH_col = paste0("RH_", 1:9),
+  indoor = c(TRUE,TRUE,TRUE, TRUE,TRUE,FALSE, TRUE,TRUE,TRUE)
+)
+
+```
+
+
+
+ MODULE 1 LOAD DATA
+
+
+```{r}
+
+df <- read_csv("/Users/prithwirajchatterjee/Downloads/energydata_complete.csv", show_col_types = FALSE)
+df$date <- parse_date_time(df$date, orders = c("ymd HMS","ymd HM","ymd"))
+df <- df %>% arrange(date) %>% drop_na(date)
+
+cat(sprintf("Rows   : %d\n", nrow(df)))
+cat(sprintf("Period : %s → %s\n",
+            format(min(df$date), "%Y-%m-%d"),
+            format(max(df$date), "%Y-%m-%d")))
+
+cat("\n─ Sensor Summaryn")
+cat(sprintf("%-14s %-12s %-10s %-12s %s\n",
+            "Room","T mean °C","T std","RH mean %","Indoor?"))
+cat(strrep("-", 58), "\n")
+for (i in 1:9) {
+  r <- ROOMS[i,]
+  cat(sprintf("%-14s %-12.1f %-10.1f %-12.1f %s\n",
+              r$name,
+              mean(df[[r$T_col]]),
+              sd(df[[r$T_col]]),
+              mean(df[[r$RH_col]]),
+              ifelse(r$indoor, "yes", "NO — excluded")))
+}
+cat(sprintf("%-14s %-12.1f %-10.1f %-12.1f %s\n",
+            "Outside", mean(df$T_out), sd(df$T_out), mean(df$RH_out), "—"))
+cat("\n NOTE: T6 (Garage) avg = 7.9°C ≈ outdoor — excluded from occupancy\n\n")
+```
+
+MODULE 2  EDA
+```{r}
+
+# 2A. All indoor room temperatures for the first 2 weeks
+indoor_T_cols <- ROOMS$T_col[ROOMS$indoor]   # T1..T5, T7..T9 (not T6)
+
+temp_long <- df %>%
+  dplyr::select(date, all_of(indoor_T_cols)) %>%
+  pivot_longer(-date, names_to = "T_col", values_to = "temp") %>%
+  left_join(dplyr::select(ROOMS, T_col, name), by = "T_col") %>%
+  filter(date < min(date) + days(14))
+
+p2a <- ggplot(temp_long, aes(x = date, y = temp, color = name)) +
+  geom_line(alpha = 0.7, linewidth = 0.4) +
+  scale_color_manual(values = PAL$rooms[1:8]) +
+  labs(title    = "All indoor room temperatures for the first 2 weeks",
+       subtitle = "Overnight drops reveal empty rooms",
+       x = NULL, y = "Temperature (°C)", color = "Room") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "right")
+print(p2a)
+
+# 2B. Temperature heatmaps — Kitchen (T1) and Bedroom 1 (T7)
+for (room_i in c(1, 7)) {
+  r   <- ROOMS[room_i, ]
+  tmp <- df %>%
+    mutate(date_only = as.Date(date), hr = hour(date)) %>%
+    group_by(date_only, hr) %>%
+    summarise(temp = mean(.data[[r$T_col]], na.rm = TRUE), .groups = "drop")
+  
+  p <- ggplot(tmp, aes(x = hr, y = date_only, fill = temp)) +
+    geom_tile() +
+    scale_fill_gradientn(
+      colors = c("#2C7BB6","#ABD9E9","white","#FDAE61","#D7191C"),
+      name = "°C") +
+    scale_x_continuous(breaks = seq(0, 23, 3),
+                       labels = sprintf("%02d:00", seq(0, 23, 3))) +
+    labs(title    = sprintf("Temperature heatmap — %s (%s)", r$name, r$T_col),
+         subtitle = "Blue = cool (empty/night)  •  Red = warm (occupied)",
+         x = "Hour of day", y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"))
+  print(p)
+}
+
+# 2C. Bathroom humidity heatmap
+rh5 <- df %>%
+  mutate(date_only = as.Date(date), hr = hour(date)) %>%
+  group_by(date_only, hr) %>%
+  summarise(rh = mean(RH_5, na.rm = TRUE), .groups = "drop")
+
+p2c <- ggplot(rh5, aes(x = hr, y = date_only, fill = rh)) +
+  geom_tile() +
+  scale_fill_gradientn(
+    colors = c("#EFF3FF","#BDD7E7","#6BAED6","#2171B5","#084594"),
+    name = "RH %") +
+  scale_x_continuous(breaks = seq(0, 23, 3),
+                     labels = sprintf("%02d:00", seq(0, 23, 3))) +
+  labs(title    = "Humidity heatmap — Bathroom (RH_5)",
+       subtitle = "Spikes = shower/bath events direct human-presence signal",
+       x = "Hour of day", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+print(p2c)
+
+# 2D. Correlation matrix
+corr_cols <- df %>%
+  dplyr::select(Appliances, lights,
+                T1, T2, T3, T4, T5, T7, T8, T9,
+                RH_1, RH_2, RH_3, RH_4, RH_5, RH_7, RH_8, RH_9,
+                T_out, RH_out, Windspeed) %>%
+  drop_na()
+
+corrplot(cor(corr_cols),
+         method = "color", type = "upper",
+         tl.cex = 0.65, tl.col = "black",
+         col = colorRampPalette(c("#D7191C","white","#2171B5"))(200),
+         addCoef.col = "black", number.cex = 0.45,
+         title = "Correlation of all indoor sensors + weather",
+         mar = c(0, 0, 2, 0))
+
+# 2E. Lights ON vs OFF violin
+p2e <- df %>%
+  mutate(lights_state = ifelse(lights > 0, "Lights ON", "Lights OFF")) %>%
+  ggplot(aes(x = lights_state, y = Appliances, fill = lights_state)) +
+  geom_violin(alpha = 0.7, show.legend = FALSE) +
+  geom_boxplot(width = 0.1, fill = "white", show.legend = FALSE) +
+  scale_fill_manual(values = c("Lights ON" = "#FDAE61", "Lights OFF" = "#2C7BB6")) +
+  labs(title    = "Appliance energy: lights ON vs OFF",
+       subtitle = "Lights = proxy for active occupancy",
+       x = NULL, y = "Energy (Wh)") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+print(p2e)
+```
+
+ MODULE 3 OCCUPANCY SCORING
+```{r}
+
+indoor_rooms <- ROOMS %>% dplyr::filter(indoor)
+
+occ_score_df <- df %>%
+  mutate(
+    dRH_out = RH_out - lag(RH_out, default = first(RH_out)),
+    dT_out  = T_out  - lag(T_out,  default = first(T_out))
+  )
+
+for (i in 1:nrow(indoor_rooms)) {
+  r         <- indoor_rooms[i, ]
+  score_col <- paste0("occ_", r$id)
+  
+  occ_score_df <- occ_score_df %>%
+    mutate(
+      dRH_room  = .data[[r$RH_col]] - lag(.data[[r$RH_col]],
+                                          default = first(.data[[r$RH_col]])),
+      rh_signal = pmax(0, dRH_room - dRH_out),
+      
+      dT_room   = .data[[r$T_col]] - lag(.data[[r$T_col]],
+                                         default = first(.data[[r$T_col]])),
+      t_signal  = pmax(0, dT_room - dT_out),
+      
+      lights_sig = ifelse(r$id %in% c(1, 2, 4),
+                          lights / max(lights, na.rm = TRUE), 0),
+      
+      !!score_col := pmin(1, pmax(0,
+                                  0.4 * pmin(1, rh_signal / 3) +
+                                    0.3 * pmin(1, t_signal  / 0.5) +
+                                    0.3 * lights_sig
+      ))
+    ) %>%
+    dplyr::select(-dRH_room, -rh_signal, -dT_room, -t_signal, -lights_sig)
+}
+
+cat("Occupancy score columns created: occ_1 through occ_9\n\n")
+
+# Hourly aggregation
+occ_hourly <- occ_score_df %>%
+  mutate(date_hour = floor_date(date, "hour")) %>%
+  group_by(date_hour) %>%
+  summarise(
+    Appliances        = mean(Appliances),
+    lights            = mean(lights),
+    T_out             = mean(T_out),
+    RH_out            = mean(RH_out),
+    hour              = first(hour(date)),
+    is_weekend        = first(ifelse(wday(date) %in% c(1, 7), 1, 0)),
+    across(starts_with("occ_"), max),
+    across(all_of(ROOMS$T_col[ROOMS$indoor]),  mean),
+    across(all_of(ROOMS$RH_col[ROOMS$indoor]), mean),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    occ_house = rowMeans(dplyr::select(., starts_with("occ_")), na.rm = TRUE),
+    lag1  = lag(Appliances, 1,  default = NA),
+    lag24 = lag(Appliances, 24, default = NA),
+    roll3 = (lag(Appliances, 1, default = NA) +
+               lag(Appliances, 2, default = NA) +
+               lag(Appliances, 3, default = NA)) / 3
+  ) %>%
+  drop_na()
+
+cat(sprintf("Hourly rows after lag drop: %d\n\n", nrow(occ_hourly)))
+
+# Plot 7 — per-room occupancy scores for the first 7 days
+occ_plot_long <- occ_hourly %>%
+  dplyr::select(date_hour, starts_with("occ_"), -occ_house) %>%
+  pivot_longer(-date_hour, names_to = "room_id", values_to = "score") %>%
+  mutate(room_id = as.integer(str_remove(room_id, "occ_"))) %>%
+  left_join(dplyr::select(ROOMS, id, name), by = c("room_id" = "id"))
+
+p3a <- occ_plot_long %>%
+  dplyr::filter(date_hour < min(date_hour) + days(7)) %>%
+  ggplot(aes(x = date_hour, y = score, color = name)) +
+  geom_line(alpha = 0.7, linewidth = 0.5) +
+  facet_wrap(~name, ncol = 2) +
+  scale_color_manual(values = PAL$rooms) +
+  labs(title    = "Room occupancy scores for the first 7 days",
+       subtitle = "Score 0–1 from RH rise, temperature rise, and lights",
+       x = NULL, y = "Occupancy score", color = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "none")
+print(p3a)
+
+# Plot 8 — all-room occupancy matrix, first 3 weeks
+occ_matrix <- occ_hourly %>%
+  dplyr::select(date_hour, starts_with("occ_"), -occ_house) %>%
+  dplyr::filter(date_hour < min(date_hour) + days(21)) %>%
+  pivot_longer(-date_hour, names_to = "room_id", values_to = "score") %>%
+  mutate(room_id = as.integer(str_remove(room_id, "occ_"))) %>%
+  left_join(dplyr::select(ROOMS, id, name), by = c("room_id" = "id"))
+
+p3b <- ggplot(occ_matrix,
+              aes(x = date_hour, y = reorder(name, -room_id), fill = score)) +
+  geom_tile() +
+  scale_fill_gradientn(
+    colors = c("#EFF3FF","#BDD7E7","#6BAED6","#2171B5","#08306B"),
+    name = "Occupancy\nscore", limits = c(0, 1)) +
+  labs(title    = "Room occupancy matrix for the first 3 weeks",
+       subtitle = "Dark = occupied  •  Light = empty / asleep",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title  = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+print(p3b)
+```
+
+ MODULE 4  ROUTINE MINING
+```{r}
+
+# Plot 9 — routine heatmap
+routine_df <- occ_hourly %>%
+  mutate(dow = wday(date_hour, label = TRUE, abbr = TRUE)) %>%
+  group_by(dow, hour) %>%
+  summarise(occ_house = mean(occ_house), .groups = "drop")
+
+p4a <- ggplot(routine_df, aes(x = hour, y = dow, fill = occ_house)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  scale_fill_gradientn(
+    colors = c("#EFF3FF","#6BAED6","#2171B5","#08306B"),
+    name = "Occupancy\nscore", limits = c(0, 1)) +
+  scale_x_continuous(breaks = seq(0, 23, 2),
+                     labels = sprintf("%02d:00", seq(0, 23, 2))) +
+  labs(title    = "Household routine heatmap",
+       subtitle = "Hour × day of week reveals the family's weekly schedule",
+       x = "Hour of day", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title  = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+print(p4a)
+
+# Plot 10 — weekend vs weekday
+wd_profile <- occ_hourly %>%
+  mutate(day_type = ifelse(is_weekend == 1, "Weekend", "Weekday")) %>%
+  group_by(day_type, hour) %>%
+  summarise(occ_mean = mean(occ_house),
+            occ_se   = sd(occ_house) / sqrt(n()),
+            .groups = "drop")
+
+p4b <- ggplot(wd_profile, aes(x = hour, y = occ_mean,
+                              color = day_type, fill = day_type)) +
+  geom_ribbon(aes(ymin = occ_mean - occ_se, ymax = occ_mean + occ_se),
+              alpha = 0.2, color = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c(Weekday = "#2C7BB6", Weekend = "#F46D43")) +
+  scale_fill_manual(values  = c(Weekday = "#2C7BB6", Weekend = "#F46D43")) +
+  scale_x_continuous(breaks = seq(0, 23, 2),
+                     labels = sprintf("%02d:00", seq(0, 23, 2))) +
+  labs(title    = "Weekday vs weekend occupancy profile",
+       subtitle = "Weekend peaks later as people sleeping in more, different routines",
+       x = "Hour of day", y = "Avg occupancy score",
+       color = NULL, fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title      = element_text(face = "bold"),
+        axis.text.x     = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+print(p4b)
+
+# Plot 11 — energy vs occupancy scatter
+p4c <- ggplot(occ_hourly,
+              aes(x = occ_house, y = Appliances,
+                  color = as.factor(is_weekend))) +
+  geom_point(alpha = 0.12, size = 0.8) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 1.2) +
+  scale_color_manual(values = c("0" = "#2C7BB6", "1" = "#F46D43"),
+                     labels = c("0" = "Weekday", "1" = "Weekend")) +
+  labs(title    = "Energy consumption vs house occupancy score",
+       subtitle = "Higher occupancy = higher energy use",
+       x = "House occupancy score (0–1)", y = "Appliances (Wh)",
+       color = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "top")
+print(p4c)
+
+# Plot 12 — anomaly days
+daily_energy <- occ_hourly %>%
+  mutate(date_only = as.Date(date_hour)) %>%
+  group_by(date_only) %>%
+  summarise(total_energy = sum(Appliances),
+            avg_occ      = mean(occ_house),
+            .groups = "drop") %>%
+  mutate(z_energy   = (total_energy - mean(total_energy)) / sd(total_energy),
+         is_anomaly = abs(z_energy) > 2)
+
+p4d <- ggplot(daily_energy, aes(x = date_only, y = total_energy,
+                                color = is_anomaly)) +
+  geom_line(color = "#AAAAAA", linewidth = 0.4) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("FALSE" = "#2C7BB6", "TRUE" = "#D7191C"),
+                     labels  = c("FALSE" = "Normal", "TRUE" = "Anomaly")) +
+  labs(title    = "Daily energy anomaly detection",
+       subtitle = "Red = |z-score| > 2  (unusual total consumption)",
+       x = NULL, y = "Total daily energy (Wh)", color = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "top")
+print(p4d)
+cat(sprintf("  Anomalous days: %d / %d\n\n",
+            sum(daily_energy$is_anomaly), nrow(daily_energy)))
+
+# Plot 13 — STL decomposition
+ts_full <- ts(occ_hourly$Appliances, frequency = 24)
+decomp  <- stl(ts_full, s.window = "periodic", robust = TRUE)
+plot(decomp,
+     main = "STL decomposition hourly appliance energy")
+
+# Plots 14 — ACF / PACF
+par(mfrow = c(1, 2))
+acf(occ_hourly$Appliances,  lag.max = 48,
+    main = "ACF — lag 24 = daily seasonality")
+pacf(occ_hourly$Appliances, lag.max = 48,
+     main = "PACF — AR decay structure")
+par(mfrow = c(1, 1))
+```
+
+
+MODULE 5  FORECASTING
+
+
+```{r}
+
+split_i    <- floor(0.8 * nrow(occ_hourly))
+train_data <- occ_hourly[1:split_i, ]
+test_data  <- occ_hourly[(split_i + 1):nrow(occ_hourly), ]
+actual     <- test_data$Appliances
+
+cat(sprintf("Train: %d rows  |  Test: %d rows\n\n",
+            nrow(train_data), nrow(test_data)))
+
+# A. Seasonal naive baseline
+pred_naive <- test_data$lag24
+
+# B. SARIMAX
+cat("[ B ] Fitting SARIMAX \n")
+ts_train   <- ts(train_data$Appliances, frequency = 24)
+xreg_cols  <- c("T_out", "RH_out", "is_weekend", "hour",
+                "occ_house", "lag24")
+xreg_train <- as.matrix(train_data[, xreg_cols])
+xreg_test  <- as.matrix(test_data[,  xreg_cols])
+
+model_sarimax <- auto.arima(ts_train, xreg = xreg_train,
+                            seasonal = TRUE, stepwise = TRUE,
+                            approximation = TRUE)
+pred_sarimax  <- as.numeric(
+  forecast(model_sarimax, xreg = xreg_test, h = nrow(test_data))$mean)
+cat(sprintf("   SARIMAX order: ARIMA(%s)\n\n",
+            paste(arimaorder(model_sarimax), collapse = ",")))
+
+# C. Random Forest
+cat("[ C ] Training Random Forest (200 trees)\n")
+rf_features <- c("T_out","RH_out","hour","is_weekend",
+                 "lag1","lag24","roll3",
+                 "occ_house","occ_1","occ_2","occ_7","occ_8")
+
+model_rf <- randomForest(
+  as.formula(paste("Appliances ~", paste(rf_features, collapse = " + "))),
+  data = train_data, ntree = 200, importance = TRUE
+)
+pred_rf <- predict(model_rf, newdata = test_data)
+cat("   Done.\n\n")
+
+# Metrics
+mape_fn <- function(a, p) mean(abs((a - p) / a), na.rm = TRUE) * 100
+
+results <- data.frame(
+  Model = c("Seasonal Naive", "SARIMAX", "Random Forest"),
+  RMSE  = c(rmse(actual, pred_naive),
+            rmse(actual, pred_sarimax),
+            rmse(actual, pred_rf)),
+  MAE   = c(mae(actual, pred_naive),
+            mae(actual, pred_sarimax),
+            mae(actual, pred_rf)),
+  MAPE  = c(mape_fn(actual, pred_naive),
+            mape_fn(actual, pred_sarimax),
+            mape_fn(actual, pred_rf))
+) %>% mutate(across(where(is.numeric), ~round(., 3)))
+
+
+cat( "FINAL PERFORMANCE METRICS \n")
+print(results, row.names = FALSE)
+
+cat(sprintf("\nBest model (RMSE): %s\n\n",
+            results$Model[which.min(results$RMSE)]))
+
+# Plot 15 — all models vs actual
+test_long <- test_data %>%
+  dplyr::select(date_hour) %>%
+  mutate(Actual         = actual,
+         Seasonal_Naive = pred_naive,
+         SARIMAX        = pred_sarimax,
+         Random_Forest  = pred_rf) %>%
+  pivot_longer(-date_hour, names_to = "Model", values_to = "Value")
+
+p5a <- ggplot(test_long,
+              aes(x = date_hour, y = Value,
+                  color = Model, linewidth = Model)) +
+  geom_line(alpha = 0.85) +
+  scale_color_manual(values = c(Actual         = "#2C7BB6",
+                                Seasonal_Naive = "#AAAAAA",
+                                SARIMAX        = "#F46D43",
+                                Random_Forest  = "#1A9641")) +
+  scale_linewidth_manual(values = c(Actual = 1, Seasonal_Naive = 0.5,
+                                    SARIMAX = 0.7, Random_Forest = 0.7)) +
+  labs(title    = "All models vs actual for full test period",
+       subtitle = "Occupancy score used as feature in SARIMAX and RF",
+       x = NULL, y = "Energy (Wh)", color = NULL, linewidth = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "top")
+print(p5a)
+
+# Plot 16 — 7-day zoom
+p5b <- test_long %>%
+  dplyr::filter(date_hour <= min(test_data$date_hour) + days(7)) %>%
+  ggplot(aes(x = date_hour, y = Value,
+             color = Model, linewidth = Model)) +
+  geom_line(alpha = 0.9) +
+  scale_color_manual(values = c(Actual         = "#2C7BB6",
+                                Seasonal_Naive = "#AAAAAA",
+                                SARIMAX        = "#F46D43",
+                                Random_Forest  = "#1A9641")) +
+  scale_linewidth_manual(values = c(Actual = 1, Seasonal_Naive = 0.5,
+                                    SARIMAX = 0.8, Random_Forest = 0.8)) +
+  labs(title = "7-day zoom  test period",
+       x = NULL, y = "Energy (Wh)", color = NULL, linewidth = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "top")
+print(p5b)
+
+# Plot 17 — residuals
+resid_long <- test_data %>%
+  dplyr::select(date_hour) %>%
+  mutate(SARIMAX       = actual - pred_sarimax,
+         Random_Forest = actual - pred_rf) %>%
+  pivot_longer(-date_hour, names_to = "Model", values_to = "Residual")
+
+p5c <- ggplot(resid_long,
+              aes(x = date_hour, y = Residual, color = Model)) +
+  geom_line(alpha = 0.6, linewidth = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~Model, ncol = 1) +
+  scale_color_manual(values = c(SARIMAX = "#F46D43",
+                                Random_Forest = "#1A9641")) +
+  labs(title    = "Residuals over time",
+       subtitle = "",
+       x = NULL, y = "Residual (Wh)") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "none")
+print(p5c)
+
+# Plot 18 — actual vs predicted scatter
+scatter_df <- data.frame(Actual   = actual,
+                         SARIMAX  = pred_sarimax,
+                         RF       = pred_rf) %>%
+  pivot_longer(-Actual, names_to = "Model", values_to = "Predicted")
+
+p5d <- ggplot(scatter_df, aes(x = Actual, y = Predicted, color = Model)) +
+  geom_point(alpha = 0.2, size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~Model) +
+  scale_color_manual(values = c(SARIMAX = "#F46D43", RF = "#1A9641")) +
+  labs(title    = "Actual vs predicted",
+       subtitle = "Points on dashed line = perfect prediction",
+       x = "Actual (Wh)", y = "Predicted (Wh)") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "none")
+print(p5d)
+
+# Plot 19 — model comparison bars
+results_long <- results %>%
+  pivot_longer(c(RMSE, MAE, MAPE), names_to = "Metric", values_to = "Value")
+
+p5e <- ggplot(results_long, aes(x = Model, y = Value, fill = Model)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = round(Value, 2)),
+            vjust = -0.4, size = 3.2, fontface = "bold") +
+  facet_wrap(~Metric, scales = "free_y") +
+  scale_fill_manual(values = c("Seasonal Naive" = "#AAAAAA",
+                               SARIMAX         = "#F46D43",
+                               "Random Forest" = "#1A9641")) +
+  labs(title    = "Model comparison — RMSE, MAE, MAPE",
+       subtitle = "Lower is better",
+       x = NULL, y = "Error") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title  = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 20, hjust = 1))
+print(p5e)
+
+# Plot 20 — RF feature importance
+imp_df <- importance(model_rf) %>%
+  as.data.frame() %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(`%IncMSE`)) %>%
+  mutate(Feature = fct_reorder(Feature, `%IncMSE`),
+         type = case_when(
+           str_detect(Feature, "occ")      ~ "Occupancy (bio-analytics)",
+           str_detect(Feature, "lag|roll") ~ "Lag (temporal)",
+           TRUE                            ~ "Context"
+         ))
+
+p5f <- ggplot(imp_df, aes(x = Feature, y = `%IncMSE`, fill = type)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("Occupancy (bio-analytics)" = "#2171B5",
+                               "Lag (temporal)"           = "#1A9641",
+                               "Context"                  = "#AAAAAA")) +
+  labs(title    = "RF feature importance ?",
+       subtitle = "Blue = occupancy scores ",
+       x = NULL, y = "% increase in MSE", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "top")
+print(p5f)
+```
